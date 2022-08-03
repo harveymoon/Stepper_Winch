@@ -8,3 +8,12 @@ This repo contains code for an ESP 8266 wifi chip as well as communication examp
 
 
 ![touchdesigner control interface](touchController.png)
+
+
+Setup to work with a pololu a4988 stepper driver. 
+
+Pinout :
+endStop = D4
+EnablePin = D7
+step = D2
+dir = D3
