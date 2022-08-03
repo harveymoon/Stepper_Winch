@@ -21,3 +21,22 @@ EnablePin = D7
 step = D2
 
 dir = D3
+
+
+OSC commands:
+
+/help
+
+/calibrate
+
+/stats
+
+/microstep 0,0,0
+
+/position 100
+
+/speed 100
+
+/acc 1000
+
+/capture
