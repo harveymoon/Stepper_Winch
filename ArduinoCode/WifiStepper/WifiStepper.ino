@@ -210,11 +210,17 @@ void setup() {
   
   ESP.wdtFeed();
   
-  
+    // ==== OTA SETUP ====
+  ArduinoOTA.setHostname(DeviceName); // use the dynamic device name
+  // Optional: set a password (uncomment & change) or use hash
+  // ArduinoOTA.setPassword("change_me");
+  WiFi.mode(WIFI_STA);                   // must be STA before setting hostname
+  WiFi.hostname(DeviceName);
+
   WiFiManager wifiManager;
   wifiManager.setConfigPortalTimeout(300);
+  wifiManager.setHostname(DeviceName);   // <-- give WiFiManager the same hostname
   wifiManager.autoConnect(DeviceName);
-  
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
   
@@ -234,10 +240,7 @@ void setup() {
   server.begin();
   MDNS.addService("http", "tcp", 80);
 
-  // ==== OTA SETUP ====
-  ArduinoOTA.setHostname(DeviceName); // use the dynamic device name
-  // Optional: set a password (uncomment & change) or use hash
-  // ArduinoOTA.setPassword("change_me");
+
   ArduinoOTA.onStart([]() {
     String type = (ArduinoOTA.getCommand() == U_FLASH) ? F("sketch") : F("filesystem");
     Serial.print(F("OTA Start updating "));
