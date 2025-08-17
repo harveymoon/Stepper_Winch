@@ -2,13 +2,14 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 #include <OSCMessage.h>
 #include <OSCBundle.h>
 #include <EEPROM.h>
 
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
-#include <WiFiManager.h>         //https://github.com/tzapu/WiFiManager
+#include <WiFiManager.h>  //https://github.com/tzapu/WiFiManager
 
 #include <AccelStepper.h>
 
@@ -19,9 +20,9 @@
 #define NAME_VALID_FLAG_ADDR (NAME_START_ADDR + NAME_MAX_LENGTH)
 #define NAME_VALID_FLAG 0xAB
 
-char DeviceName[NAME_MAX_LENGTH] = ""; // Default name, will be overwritten
+char DeviceName[NAME_MAX_LENGTH] = "";  // Default name, will be overwritten
 
-const char* HELP = "/help, /calibrate, /stats, /position 100, /speed 100, /acc 1000, /capture, /continuous_move, /stop, /set_name yourname";// (Heartbeat every 5s to 239.1.1.1:7777)";
+const char *HELP = "/help, /calibrate, /stats, /position 100, /set_current 0, /rel_move 400, /speed 100, /acc 1000, /continuous_move, /stop, /enable 1|0, /set_name yourname";
 
 ///Low    Low   Low   Full step
 ///High   Low   Low   Half step
@@ -35,23 +36,23 @@ char SerialContent[30];
 
 // a instance of UDP  to send and receive packets (udp, oviously!;)
 WiFiUDP Udp;
-IPAddress outIp(6, 6, 6, 6);    //ip address of the receiving host
+IPAddress outIp(6, 6, 6, 6);  //ip address of the receiving host
 //IPAddress outIp(192,168,1,26);Incomming
-const unsigned int outPort = 9120;              //host port
-const unsigned int localPort = 9999;        // local port to listen for UDP packets (here's where we send the packets)
+const unsigned int outPort = 9120;    //host port
+const unsigned int localPort = 9999;  // local port to listen for UDP packets (here's where we send the packets)
 
 // Multicast configuration
-IPAddress multicastIP(239, 1, 2, 1);  // Multicast group address
+IPAddress multicastIP(239, 1, 2, 1);      // Multicast group address
 const unsigned int multicastPort = 7777;  // Multicast port
 unsigned long lastHeartbeatTime = 0;
 const unsigned long heartbeatInterval = 5000;  // Send heartbeat every 5 seconds
 
 
-AccelStepper stepper(1, D5, D0); // mode, step, dir
+AccelStepper stepper(1, D5, D0);  // mode, step, dir
 
 const byte endStop = D4;
 const int EnablePin = D7;
-const int ledPin =  BUILTIN_LED;      // the number of the LED pin
+const int ledPin = BUILTIN_LED;  // the number of the LED pin
 
 unsigned long ACC = 100;
 unsigned int SPEED = 1000;
@@ -60,6 +61,22 @@ unsigned long POS;
 boolean constantMode = false;
 
 boolean stopped = true;
+
+// Track whether the motor driver is currently enabled (active LOW pin logic)
+bool motorEnabled = true;  // set true after setup config of EnablePin LOW
+
+// End-stop interrupt state (non-blocking handling)
+volatile bool endStopFlag = false;            // set by ISR when end stop triggers
+volatile unsigned long endStopLastMicros = 0; // debounce timer
+const unsigned long ENDSTOP_DEBOUNCE_US = 5000; // 5 ms debounce
+
+ICACHE_RAM_ATTR void endStopISR() {
+  unsigned long now = micros();
+  if (now - endStopLastMicros > ENDSTOP_DEBOUNCE_US) {
+    endStopLastMicros = now;
+    endStopFlag = true; // main loop will act
+  }
+}
 
 // Define a reasonable buffer size for UDP packets
 // OSC messages are typically small, but we want to handle larger ones if needed
@@ -120,7 +137,7 @@ bool loadNameFromEEPROM() {
 }
 
 void routeSetName(OSCMessage &msg, int addrOffset) {
-  char newName[NAME_MAX_LENGTH] = {0};
+  char newName[NAME_MAX_LENGTH] = { 0 };
   msg.getString(0, newName, NAME_MAX_LENGTH);
   
   if (strlen(newName) > 0) {
@@ -128,7 +145,7 @@ void routeSetName(OSCMessage &msg, int addrOffset) {
     Serial.println(newName);
     
     strncpy(DeviceName, newName, NAME_MAX_LENGTH - 1);
-    DeviceName[NAME_MAX_LENGTH - 1] = 0; // Ensure null termination
+    DeviceName[NAME_MAX_LENGTH - 1] = 0;  // Ensure null termination
     
     saveNameToEEPROM();
     
@@ -139,6 +156,8 @@ void routeSetName(OSCMessage &msg, int addrOffset) {
     } else {
       Serial.println("MDNS restarted with new name");
     }
+  // Update OTA hostname too (no need to re-begin, just set new hostname before next begin if ever restarted)
+  ArduinoOTA.setHostname(DeviceName);
     
     sendMessage("Name updated and saved");
   } else {
@@ -147,23 +166,19 @@ void routeSetName(OSCMessage &msg, int addrOffset) {
 }
 
 void sendHeartbeat() {
+
+  // sends a heartbeat message, message includes this format:
+  // /heartbeat <DeviceName> <CurrentPosition> <IsRunning> <Speed> <Acceleration> <Enabled>
   OSCMessage msg("/heartbeat");
   msg.add(DeviceName);
   msg.add((int32_t)stepper.currentPosition());
-
-  // msg.add((int32_t)(stepper.isRunning() ? 1 : 0));
-
-// bool is running
-
-
-  bool isRunning = stepper.distanceToGo() != 0;
-  msg.add((int32_t)isRunning);
-
-
-
-  // also add speed and acc
+  
+  msg.add((int32_t)(stepper.distanceToGo() != 0)); // is running boolean
+  
+  // also add speed, acc, enabled flag
   msg.add((int32_t)SPEED);
   msg.add((int32_t)ACC);
+  msg.add((int32_t)(motorEnabled ? 1 : 0));
   
   Udp.beginPacket(multicastIP, multicastPort);
   msg.send(Udp);
@@ -179,7 +194,7 @@ void sendHeartbeat() {
 void setup() {
   Serial.begin(115200);
   Serial.println("STARTING");
-
+  
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
   
@@ -188,24 +203,24 @@ void setup() {
     generateUniqueName();
     saveNameToEEPROM();
   }
-
+  
   pinMode(EnablePin, OUTPUT);
-
+  
   digitalWrite(EnablePin, LOW);
-
+  
   ESP.wdtFeed();
-
-
+  
+  
   WiFiManager wifiManager;
-
+  wifiManager.setConfigPortalTimeout(300);
   wifiManager.autoConnect(DeviceName);
-
+  
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
-
+  
   // disable esp wifi sleep
   // WiFi.setSleepMode(WIFI_NONE_SLEEP);
-
+  
   Udp.begin(localPort);
   // Udp.setTimeout(0); // make sure parsePacket() doesn't block
   Serial.println(Udp.localPort());
@@ -215,83 +230,109 @@ void setup() {
       delay(1000);
     }
   }
-// join multicast group
-  // Udp.beginMulticast(WiFi.localIP(), multicastIP, localPort);
+  // Start HTTP status server
+  server.begin();
+  MDNS.addService("http", "tcp", 80);
 
-
-  // // Start TCP (HTTP) server
-  // server.begin();
-  // MDNS.addService("http", "tcp", 80);
-  // // Serial.print("Setup Done ");
-
-
+  // ==== OTA SETUP ====
+  ArduinoOTA.setHostname(DeviceName); // use the dynamic device name
+  // Optional: set a password (uncomment & change) or use hash
+  // ArduinoOTA.setPassword("change_me");
+  ArduinoOTA.onStart([]() {
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? F("sketch") : F("filesystem");
+    Serial.print(F("OTA Start updating "));
+    Serial.println(type);
+    // If updating FS: unmount here (SPIFFS.end()/LittleFS.end()) if used
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println(F("\nOTA End"));
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    static unsigned int lastPct = 101; // force first print
+    unsigned int pct = (progress * 100) / total;
+    if (pct != lastPct) { // reduce spam
+      lastPct = pct;
+      Serial.printf("OTA Progress: %u%%\r", pct);
+    }
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println(F("Auth Failed"));
+    else if (error == OTA_BEGIN_ERROR) Serial.println(F("Begin Failed"));
+    else if (error == OTA_CONNECT_ERROR) Serial.println(F("Connect Failed"));
+    else if (error == OTA_RECEIVE_ERROR) Serial.println(F("Receive Failed"));
+    else if (error == OTA_END_ERROR) Serial.println(F("End Failed"));
+  });
+  ArduinoOTA.begin();
+  Serial.println(F("OTA Ready"));
+  Serial.print(F("OTA Hostname: ")); Serial.println(DeviceName);
+  
   Serial.println(DeviceName);
   // date and time of compilation
   Serial.println(__DATE__);
   Serial.println(__TIME__);
-
+  
   stepper.setMaxSpeed(1000);
   stepper.setSpeed(1000);
   stepper.setAcceleration(1000.0);
   stepper.setCurrentPosition(0);
-
+  
   pinMode(ledPin, OUTPUT);
   pinMode(endStop, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(endStop), endStopISR, FALLING); // active LOW switch
   delay(1000);
   //calibrate();
   //delay(15000);
-  
+
   // Send initial heartbeat
   sendHeartbeat();
 }
-
 
 void sendPos(int nowPos) {
   OSCMessage msg("/pos");
   msg.add((int32_t)nowPos);
   Udp.beginPacket(outIp, outPort);
-  msg.send(Udp); // send the bytes to the SLIP stream
-  Udp.endPacket(); // mark the end of the OSC Packet
-  msg.empty(); // free space occupied by message
+  msg.send(Udp);    // send the bytes to the SLIP stream
+  Udp.endPacket();  // mark the end of the OSC Packet
+  msg.empty();      // free space occupied by message
   delay(1);
 }
 
-void sendMessage(const char* serialMessage) {
+void sendMessage(const char *serialMessage) {
   OSCMessage msg("/feedback");
   msg.add(serialMessage);
-
+  
   Udp.beginPacket(outIp, outPort);
-  msg.send(Udp); // send the bytes to the SLIP stream
-  Udp.endPacket(); // mark the end of the OSC Packet
-  msg.empty(); // free space occupied by message
+  msg.send(Udp);    // send the bytes to the SLIP stream
+  Udp.endPacket();  // mark the end of the OSC Packet
+  msg.empty();      // free space occupied by message
   delay(1);
 }
 
-int readline(int readch, char *buffer, int len)
-{
+int readline(int readch, char *buffer, int len) {
   static int pos = 0;
   int rpos;
-
+  
   if (readch > 0) {
     switch (readch) {
-      case '\n': // Ignore new-lines
-        break;
-      case '\r': // Return on CR
-        rpos = pos;
-        pos = 0;  // Reset position index ready for next time
-        return rpos;
+      case '\n':  // Ignore new-lines
+      break;
+      case '\r':  // Return on CR
+      rpos = pos;
+      pos = 0;  // Reset position index ready for next time
+      return rpos;
       default:
-        if (pos < len - 1) {
-          buffer[pos++] = readch;
-          buffer[pos] = 0;
-        }
+      if (pos < len - 1) {
+        buffer[pos++] = readch;
+        buffer[pos] = 0;
+      }
     }
   }
   // No end of line has been found, so return -1.
   return -1;
 }
 
-void routeHelp(OSCMessage &msg, int addrOffset ) {
+void routeHelp(OSCMessage &msg, int addrOffset) {
   char boo[25];
   msg.getString(0, boo, 25);
   Serial.println("Help : ");
@@ -299,51 +340,51 @@ void routeHelp(OSCMessage &msg, int addrOffset ) {
   sendMessage(HELP);
 }
 
-void routeStats(OSCMessage &msg, int addrOffset ) {
+void routeStats(OSCMessage &msg, int addrOffset) {
   char boo[25];
   msg.getString(0, boo, 25);
-
-  String STATSN = "Stats : Pos :" ;
-  STATSN +=  POS;
-  STATSN += ",ACC:" ;
-  STATSN +=   ACC;
-  STATSN += ",SPEED:" ;
-  STATSN +=   SPEED;
+  
+  String STATSN = "Stats : Pos :";
+  STATSN += POS;
+  STATSN += ",ACC:";
+  STATSN += ACC;
+  STATSN += ",SPEED:";
+  STATSN += SPEED;
+  STATSN += ",EN:";
+  STATSN += (motorEnabled ? 1 : 0);
   Serial.println(STATSN);
   char charBuf[50];
   STATSN.toCharArray(charBuf, 50);
   sendMessage(charBuf);
 }
 
-void routeCalibrate(OSCMessage &msg, int addrOffset ) {
+void routeCalibrate(OSCMessage &msg, int addrOffset) {
   calibrate();
 }
 
-
-
-void routePos(OSCMessage &msg, int addrOffset ) {
-   long posN = msg.getInt(0);
-   
-//  char str[msg.getDataLength(0)];
-//  //  Serial.print("Just Got in : ");
-//  msg.getString(0, str, 8);
-//  unsigned long posN = String(str).toInt();
-
+void routePos(OSCMessage &msg, int addrOffset) {
+  long posN = msg.getInt(0);
   Serial.println("Incomming Pos : ");
   Serial.println(posN);
   sendHeartbeat();
   stepper.moveTo(posN);
-
+   stopped = false;
 }
 
-void dispense(OSCMessage &msg, int addrOffset){
-  int posN =  stepper.currentPosition() + 400;
-  stepper.moveTo(posN);
+// Relative move: /rel_move <deltaSteps>
+void routeRelMove(OSCMessage &msg, int addrOffset) {
+  long delta = msg.getInt(0); // positive or negative
+  long target = stepper.currentPosition() + delta;
+  stepper.moveTo(target);
+   stopped = false;
+  Serial.print("Relative move: delta="); Serial.print(delta); Serial.print(" target="); Serial.println(target);
+  sendMessage("Relative move queued");
+  sendHeartbeat(); // reflect new target intention
 }
 
-void routeContinuousMove(OSCMessage &msg, int addrOffset ) {
-  int direction = msg.getInt(0);  // 1 for forward, -1 for backward
-  int speedValue = msg.getInt(1); // Speed value
+void routeContinuousMove(OSCMessage &msg, int addrOffset) {
+  int direction = msg.getInt(0);   // 1 for forward, -1 for backward
+  int speedValue = msg.getInt(1);  // Speed value
   
   Serial.print("Continuous move: Direction = ");
   Serial.print(direction);
@@ -351,7 +392,7 @@ void routeContinuousMove(OSCMessage &msg, int addrOffset ) {
   Serial.println(speedValue);
   
   // Set to continuous movement mode
-  stepper.setSpeed(speedValue*direction);
+  stepper.setSpeed(speedValue * direction);
   stepper.setMaxSpeed(speedValue);
   // stepper.moveTo(direction * 1000000); // Move a very large distance in the specified direction
   
@@ -360,7 +401,7 @@ void routeContinuousMove(OSCMessage &msg, int addrOffset ) {
   sendMessage("Continuous movement started");
 }
 
-void routeStop(OSCMessage &msg, int addrOffset ) {
+void routeStop(OSCMessage &msg, int addrOffset) {
   // Stop the stepper immediately
   stepper.stop();
   stopped = true;
@@ -369,7 +410,7 @@ void routeStop(OSCMessage &msg, int addrOffset ) {
   sendMessage("Stopped");
 }
 
-void routeSpeed(OSCMessage &msg, int addrOffset ) {
+void routeSpeed(OSCMessage &msg, int addrOffset) {
   int speedN = msg.getInt(0);
   Serial.println("Incomming Speed : ");
   Serial.println(speedN);
@@ -378,7 +419,7 @@ void routeSpeed(OSCMessage &msg, int addrOffset ) {
   stepper.setMaxSpeed(speedN);
 }
 
-void routeAcc(OSCMessage &msg, int addrOffset ) {
+void routeAcc(OSCMessage &msg, int addrOffset) {
   int accN = msg.getInt(0);
   Serial.println("Incomming Acceleration: ");
   Serial.println(accN);
@@ -386,9 +427,94 @@ void routeAcc(OSCMessage &msg, int addrOffset ) {
   stepper.setAcceleration(ACC);
 }
 
+// Set the current logical position of the stepper without moving (e.g. reset to 0)
+void routeSetCurrent(OSCMessage &msg, int addrOffset) {
+  long newPos = msg.getInt(0);
+  stepper.setCurrentPosition(newPos);
+  POS = newPos; // keep cached value aligned until next loop refresh
+  Serial.print("Current position manually set to: ");
+  Serial.println(newPos);
+  sendMessage("Current position set");
+  sendHeartbeat(); // broadcast change
+}
+
+// Enable (1) / Disable (0) the stepper driver via its Enable pin (active LOW on most drivers)
+void routeEnable(OSCMessage &msg, int addrOffset) {
+  int en = msg.getInt(0);  // expect 1 (enable) or 0 (disable)
+  if (en == 1) {
+    // Enable driver (active LOW)
+    digitalWrite(EnablePin, LOW);
+    motorEnabled = true;
+    sendMessage("Motor Enabled");
+    Serial.println("Motor Enabled via /enable 1");
+  } else {
+    // Stop any motion before disabling
+    stepper.stop();
+    constantMode = false;
+    // Disable driver (active LOW so write HIGH)
+    digitalWrite(EnablePin, HIGH);
+    motorEnabled = false;
+    sendMessage("Motor Disabled");
+    Serial.println("Motor Disabled via /enable 0");
+  }
+}
+
+void calibrate() {
+  Serial.println("calibrating");
+  sendMessage("Calibrating");
+  stepper.setSpeed(1000);
+  stepper.moveTo(-10000);
+  
+  while (digitalRead(endStop) == 1) {
+    stepper.run();
+    delay(10);
+  }
+  delay(1000);
+  Serial.print("calibrated!");
+  sendMessage("Calibrated!");
+  stepper.setSpeed(30);
+  stepper.setCurrentPosition(0);
+  stepper.moveTo(100);
+}
+
+
+// Build a compact HTML status page (auto-refresh every 2s)
+String buildStatusPage() {
+  IPAddress ip = WiFi.localIP();
+  String html;
+  html.reserve(1400);
+  html += F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>");
+  html += DeviceName;
+  html += F(" Status</title><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='2'>");
+  html += F("<style>body{font-family:Arial;background:#111;color:#eee;margin:12px;}table{border-collapse:collapse;}td,th{border:1px solid #444;padding:4px 8px;font-size:13px;}h1{margin:0 0 8px;font-size:20px;}code{color:#9cf;}small{color:#888;} .ok{color:#6c6;} .warn{color:#fc3;} .err{color:#f66;} pre{white-space:pre-wrap;font-size:11px;background:#222;padding:8px;border:1px solid #333;} a{color:#6cf;}</style></head><body>");
+  html += F("<h1>"); html += DeviceName; html += F("</h1>");
+  html += F("<table>");
+  html += F("<tr><th>Field</th><th>Value</th></tr>");
+  html += F("<tr><td>IP</td><td>"); html += ip.toString(); html += ':'; html += localPort; html += F("</td></tr>");
+  html += F("<tr><td>Remote IP</td><td>"); html += outIp.toString(); html += ':'; html += outPort; html += F("</td></tr>");
+  html += F("<tr><td>Multicast</td><td>"); html += multicastIP.toString(); html += ':'; html += multicastPort; html += F("</td></tr>");
+  html += F("<tr><td>Position</td><td>"); html += (long)POS; html += F("</td></tr>");
+  html += F("<tr><td>Target</td><td>"); html += (long)stepper.targetPosition(); html += F("</td></tr>");
+  html += F("<tr><td>DistanceToGo</td><td>"); html += (long)stepper.distanceToGo(); html += F("</td></tr>");
+  html += F("<tr><td>Speed</td><td>"); html += (long)SPEED; html += F("</td></tr>");
+  html += F("<tr><td>Acceleration</td><td>"); html += (long)ACC; html += F("</td></tr>");
+  html += F("<tr><td>Enabled</td><td>"); html += (motorEnabled?F("Yes"):F("No")); html += F("</td></tr>");
+  html += F("<tr><td>Mode</td><td>"); html += (constantMode?F("Constant Speed"):F("MoveTo")); html += F("</td></tr>");
+  html += F("<tr><td>Moving</td><td>"); html += (stepper.distanceToGo()!=0?F("Yes"):F("No")); html += F("</td></tr>");
+  html += F("<tr><td>Last Packet Proc (ms)</td><td>"); html += packetProcessingTime; html += F("</td></tr>");
+  html += F("<tr><td>Max Packet Proc (ms)</td><td>"); html += maxProcessingTime; html += F("</td></tr>");
+  html += F("<tr><td>Heartbeat Interval (ms)</td><td>"); html += heartbeatInterval; html += F("</td></tr>");
+  html += F("</table>");
+  html += F("<h3>OSC Commands</h3><pre>");
+  html += HELP;
+  html += F("</pre><small>Auto-refresh 2s. Heartbeat multicast to ");
+  html += multicastIP.toString(); html += ':'; html += multicastPort; html += F(".</small></body></html>");
+  return html;
+}
+
 void loop() {
-  // Start timing this loop iteration
-  unsigned long loopStartTime = millis();
+  // Handle OTA first to ensure timely updates
+  ArduinoOTA.handle();
   
   // Check for UDP packets first to prioritize communication
   int packetSize = Udp.parsePacket();
@@ -414,14 +540,16 @@ void loop() {
       msgIN.route("/help", routeHelp);
       msgIN.route("/stats", routeStats);
       msgIN.route("/position", routePos);
-      msgIN.route("/dispense", dispense);
+      msgIN.route("/rel_move", routeRelMove);
       msgIN.route("/continuous_move", routeContinuousMove);
       msgIN.route("/stop", routeStop);
       msgIN.route("/speed", routeSpeed);
       msgIN.route("/acc", routeAcc);
+      msgIN.route("/enable", routeEnable);
+      msgIN.route("/set_current", routeSetCurrent);
       msgIN.route("/calibrate", routeCalibrate);
       msgIN.route("/set_name", routeSetName);
-//      msgIN.route("/capture", routeCapture);
+      //      msgIN.route("/capture", routeCapture);
     } else {
       // Only print errors occasionally to avoid console spam
       static unsigned long lastErrorTime = 0;
@@ -465,11 +593,42 @@ void loop() {
     lastHeartbeatTime = currentTime;
     sendHeartbeat();
   }
+
+  // Handle end-stop trigger (deferred from ISR to keep ISR tiny)
+  if (endStopFlag) {
+    noInterrupts(); // brief critical section to clear flag safely
+    endStopFlag = false;
+    interrupts();
+    // Stop motion for safety
+    stepper.stop();
+    constantMode = false;
+    stopped = true;
+    sendMessage("EndStop Triggered");
+    Serial.println("EndStop Triggered (interrupt)");
+    sendHeartbeat();
+  }
+  
+  
+  WiFiClient client = server.available();
+  if (client) {
+    // Basic request consume (optional, minimal parse just to skip headers)
+    unsigned long tStart = millis();
+    while (client.connected() && client.available() == 0 && millis() - tStart < 50) yield(); // this yields and allows other tasks to run
+    while (client.available()) { // discard request data quickly
+      char c = client.read();
+      if (c == '\n') break; // stop after first line
+    }
+    String body = buildStatusPage();
+    client.print(F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"));
+    client.print(body);
+    delay(1);
+    client.stop();
+  }
   
   // if (Serial.available()) {
   //   static char buffer[80];
   //   static unsigned long lastSerialRead = 0;
-    
+  
   //   // Only process serial occasionally to avoid spending too much time here
   //   if (millis() - lastSerialRead > 100) {
   //     while (Serial.available()) {
@@ -483,222 +642,6 @@ void loop() {
   
   ESP.wdtFeed();
   
-  // // Handle web client connections - but do it non-blocking
-  // WiFiClient client = server.available();
-  // if (client) {
-  //   // Set a timeout for client handling
-  //   unsigned long clientStartTime = millis();
-  //   boolean clientTimedOut = false;
-    
-  //   // Buffer for client data
-  //   String clientData = "";
-    
-  //   // Wait for data but with timeout
-  //   while (client.connected() && !client.available() && !clientTimedOut) {
-  //     if (millis() - clientStartTime > 500) { // 500ms timeout
-  //       clientTimedOut = true;
-  //     }
-  //     // Keep handling the motor while waiting for client data
-  //     if (constantMode == false) {
-  //       stepper.run();
-  //     } else {
-  //       stepper.runSpeed();
-  //     }
-  //     delay(1);
-  //   }
-    
-  //   // Only serve the web page if we didn't timeout
-  //   if (!clientTimedOut) {
-  //     // Prepare the response. Start with the common header:
-  //     String s = "HTTP/1.1 200 OK\r\n";
-  //     s += "Content-Type: text/html\r\n\r\n";
-  //     s += "<!DOCTYPE HTML>\r\n<html>\r\n";
-  //     // s += "IP = ";
-
-
-  //     s += "<head>";
-  //     s += "<style>";
-  //     s += "body {";
-  //     s += "    font-family: arial, sans-serif;";
-
-  //     s += "}";
-
-  //     s += "table {";
-  //     s += "    font-family: arial, sans-serif;";
-  //     s += "    border-collapse: collapse;";
-  //     s += "    width: 100%;";
-  //     s += "}";
-
-  //     s += "td, th {";
-  //     s += "    border: 1px solid #dddddd;";
-  //     s += "    text-align: left;";
-  //     s += "    padding: 8px;";
-  //     s += "}";
-
-  //     s += "tr:nth-child(even) {";
-  //     s += "    background-color: #dddddd;";
-  //     s += "}";
-  //     s += "</style>";
-  //     s += "</head>";
-
-  //     s += "<br>";
-
-  //     s += "<table>";
-  //     s += "  <tr>";
-  //     s += "    <th></th>";
-  //     s += "   <th>IP</th>";
-  //     s += "   <th>PORT</th>";
-  //     s += " </tr>";
-  //     s += " <tr>";
-
-  //     s += "  <td>";
-  //     s += String(DeviceName);
-  //     s += ".local</td>";
-
-  //     String str = "";
-  //     for (int i = 0; i < 4; i++)
-  //       str += i  ? "." + String(WiFi.localIP()[i]) : String(WiFi.localIP()[i]);
-  //     s += "  <td>";
-  //     s += str;
-  //     s += "</td>";
-
-  //     s += "  <td>";
-  //     s += localPort;
-  //     s += "</td>";
-
-  //     s += " </tr>";
-  //     s += "  <tr>";
-
-  //     s += "  <td>Connected To </td>";
-  //     str = "";
-
-  //     for (int i = 0; i < 4; i++) {
-  //       str += i  ? "." + String(outIp[i]) : String(outIp[i]);
-  //     }
-
-  //     s += "  <td>";
-  //     s += str;
-  //     s += "</td>";
-
-  //     s += "  <td>";
-  //     s += outPort;
-  //     s += "</td>";
-
-  //     // Add multicast heartbeat information
-  //     s += "  </tr>";
-  //     s += "  <tr>";
-  //     s += "  <td>Multicast Heartbeat</td>";
-  //     str = "";
-  //     for (int i = 0; i < 4; i++) {
-  //       str += i  ? "." + String(multicastIP[i]) : String(multicastIP[i]);
-  //     }
-  //     s += "  <td>";
-  //     s += str;
-  //     s += "</td>";
-  //     s += "  <td>";
-  //     s += multicastPort;
-  //     s += "</td>";
-  //     s += "  </tr>";
-      
-  //     // Add heartbeat content information
-  //     s += "  <tr>";
-  //     s += "  <td colspan='3'><b>Heartbeat Data</b>: Device name, Position, Running status, Speed, Acceleration</td>";
-  //     s += "  </tr>";
-      
-  //     // Add UDP buffer information
-  //     s += "  <tr>";
-  //     s += "  <td colspan='3'><b>UDP Buffer Size</b>: ";
-  //     s += UDP_BUFFER_SIZE;
-  //     s += " bytes</td>";
-  //     s += "  </tr>";
-      
-  //     s += "</table>";
-
-
-  //     s += "<br>";
-  //     s += "<br>";
-  //     s += HELP;
-  //     s += "<br>";
-  //     s += "<br>";
-
-  //     String mStr = "";
-  //     mStr += "<table>";
-  //     mStr += "  <tr>";
-  //     mStr += "    <th>MS1</th>";
-  //     mStr += "   <th>MS2</th>";
-  //     mStr += "   <th>MS3</th>";
-  //     mStr += "   <th>Resolution</th>";
-  //     mStr += " </tr>";
-  //     mStr += " <tr>";
-  //     mStr += "  <td>0</td>";
-  //     mStr += "  <td>0</td>";
-  //     mStr += "  <td>0</td>";
-  //     mStr += "  <td>FULL</td>";
-  //     mStr += " </tr>";
-  //     mStr += "  <tr>";
-  //     mStr += "  <td>1</td>";
-  //     mStr += "  <td>0</td>";
-  //     mStr += "  <td>0</td>";
-  //     mStr += "  <td>HALF</td>";
-  //     mStr += "  </tr>";
-  //     mStr += "  <tr>";
-  //     mStr += "  <td>0</td>";
-  //     mStr += "  <td>1</td>";
-  //     mStr += "  <td>0</td>";
-  //     mStr += "  <td>QUARTER</td>";
-  //     mStr += "  </tr>";
-  //     mStr += "<tr>";
-  //     mStr += "  <td>1</td>";
-  //     mStr += "  <td>1</td>";
-  //     mStr += "  <td>0</td>";
-  //     mStr += "  <td>EIGHTH</td>";
-  //     mStr += "  </tr>";
-  //     mStr += " <tr>";
-  //     mStr += "  <td>1</td>";
-  //     mStr += "  <td>1</td>";
-  //     mStr += "  <td>1</td>";
-  //     mStr += "  <td>SIXTEENTH</td>";
-  //     mStr += "  </tr>";
-  //     mStr += "</table>";
-
-  //     s += mStr;
-
-  //     // Add performance metrics to the web interface
-  //     s += "  <tr>";
-  //     s += "  <td colspan='3'><b>Last Message Processing Time</b>: ";
-  //     s += packetProcessingTime;
-  //     s += " ms, Max: ";
-  //     s += maxProcessingTime;
-  //     s += " ms</td>";
-  //     s += "  </tr>";
-      
-  //     s += "</html>\n";
-
-  //     client.print(s);
-  //   }
-    
-  //   // Close the connection
-  //   client.stop();
-  // }
-  
-  // Give WiFi and system tasks a chance to run
   yield();
 }
 
-void calibrate() {
-  Serial.println("calibrating");
-  sendMessage("Calibrating");
-  stepper.setSpeed(1000);
-  stepper.moveTo(-10000);
-
-  while (digitalRead(endStop) == 1) {
-    stepper.run();
-    delay(10);
-  }
-  delay(1000);
-  Serial.print("calibrated!");
-  sendMessage("Calibrated!");
-  stepper.setSpeed(30);
-  stepper.setCurrentPosition(0);
-  stepper.moveTo(100);
-}
